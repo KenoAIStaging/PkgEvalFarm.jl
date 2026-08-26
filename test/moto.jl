@@ -313,6 +313,37 @@ try
         @test job["attempts"] == 3
     end
 
+    @testset "retry after a dead attempt records its own log" begin
+        # a worker dying between its log upload and its result write leaves the
+        # canonical log key taken by a log that may contradict the retry's
+        # outcome (e.g. a time-limit kill whose retry passes) — the retry must
+        # store and reference its own log, not adopt the dead attempt's
+        run_id = PEF.create_run(ctx, PEF.RunSpec(configs[1:1], ["Zombie"], Dict{String,Any}());
+                                submitter="tester")
+        expand_claim = PEF.claim_job(ctx; wait=1)
+        @test expand_claim isa PEF.ClaimedExpand
+        PEF.expand_run(ctx, run_id, ["Zombie"])
+        SQS.delete_message(expand_claim.queue_url, expand_claim.receipt_handle; aws_config=aws)
+
+        # attempt 1: uploads its log, then dies before recording a result
+        S3.put_object(cfg.bucket, PEF.log_key(run_id, "primary", "Zombie"),
+            Dict("body" => "PkgEval terminated: time limit",
+                 "headers" => Dict("If-None-Match" => "*")); aws_config=aws)
+
+        # attempt 2 passes and must end up pointing at its own log
+        claimed = PEF.claim_job(ctx; wait=1)
+        @test claimed isa PEF.ClaimedJob
+        PEF.record_result(ctx, claimed, PEF.JobResult(; status="test", duration=1.0,
+                                                      log="tests passed"))
+        job = only(PEF.run_jobs(ctx, run_id))
+        @test job["status"] == "test"
+        @test job["log_key"] == PEF.log_key(run_id, "primary", "Zombie", 2)
+        @test PEF.job_log(ctx, job) == "tests passed"
+        # the dead attempt's log stays untouched at the canonical key
+        @test String(copy(S3.get_object(cfg.bucket, PEF.log_key(run_id, "primary", "Zombie"),
+            Dict("return_raw" => true); aws_config=aws))) == "PkgEval terminated: time limit"
+    end
+
     @testset "expand jobs" begin
         # empty package list => run starts in `expanding` with a single expand message
         run_id = PEF.create_run(ctx, PEF.RunSpec(configs, String[], Dict{String,Any}());
