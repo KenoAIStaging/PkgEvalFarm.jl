@@ -637,34 +637,42 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
     job = claimed.job
     result.status in TERMINAL_STATUSES || error("not a terminal status: $(result.status)")
 
-    key = log_key(job.run_id, job.config, job.package)
-    stored_log = result.log
+    # If-None-Match makes the upload create-only (and the bucket policy
+    # *requires* workers to send it): first write wins, a stored log is
+    # immutable. A taken key means a dead earlier attempt uploaded its log but
+    # died before recording a result — and that attempt may well have ended
+    # differently (a time-limit kill whose retry then passed, say), so adopting
+    # its log would pair this result with a log that contradicts it. Instead
+    # this attempt's log goes under the next free attempt-numbered key, and
+    # log_key records wherever it landed: a job's result and its log always
+    # describe the same execution.
+    key = nothing
     if result.log !== nothing
-        aws_retry() do
-            try
-                # If-None-Match makes the upload create-only (and the bucket
-                # policy *requires* workers to send it): first write wins, so an
-                # already-recorded log can never be overwritten later
-                S3.put_object(ctx.cfg.bucket, key,
-                    Dict("body" => result.log,
-                         "headers" => Dict("Content-Type" => "text/plain; charset=utf-8",
-                                           "If-None-Match" => "*"));
-                    aws_config=ctx.aws)
-            catch err
-                # a crashed earlier attempt already uploaded this job's log; that
-                # immutable log is what log_key points at, so derive error_line
-                # from it rather than from this retry's log
-                is_precondition_failed(err) || rethrow()
-                stored_log = String(copy(S3.get_object(ctx.cfg.bucket, key,
-                    Dict("return_raw" => true); aws_config=ctx.aws)))
+        for attempt in 1:10
+            candidate = log_key(job.run_id, job.config, job.package, attempt)
+            created = aws_retry() do
+                try
+                    S3.put_object(ctx.cfg.bucket, candidate,
+                        Dict("body" => result.log,
+                             "headers" => Dict("Content-Type" => "text/plain; charset=utf-8",
+                                               "If-None-Match" => "*"));
+                        aws_config=ctx.aws)
+                    true
+                catch err
+                    is_precondition_failed(err) || rethrow()
+                    false
+                end
             end
+            created && (key = candidate; break)
         end
+        key === nothing &&
+            @warn "every log key already taken; recording without a log" job.package
     end
     # first meaningful error line of hard failures, so the report can cluster
     # shared failure signatures without the logs; absent on other jobs to keep
     # the items (fetched wholesale by every run_jobs read) small
-    line = result.status in ("fail", "crash") && stored_log !== nothing ?
-           error_line(something(stored_log)) : nothing
+    line = result.status in ("fail", "crash") && result.log !== nothing ?
+           error_line(result.log) : nothing
 
     # The terminal-status write and the counter bump must be one atomic unit: a
     # worker dying between two separate writes leaves every job terminal but the
@@ -702,7 +710,7 @@ function record_result(ctx::FarmCtx, claimed::ClaimedJob, result::JobResult)
                                 (result.wall > 0 ? result.wall : result.duration) /
                                 3600 * something(SLOT_HOURLY_RATE[]) * result.slots,
                      ":peak_rss" => result.peak_rss,
-                     ":log_key" => result.log === nothing ? nothing : key,
+                     ":log_key" => key,
                      (line === nothing ? () : ((":error_line" => line),))...)))),
              Dict("Update" => Dict(
                  "TableName" => ctx.cfg.runs_table,

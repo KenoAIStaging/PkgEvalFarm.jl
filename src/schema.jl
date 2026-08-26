@@ -83,7 +83,8 @@ new_run_id(now::DateTime=Dates.now(UTC)) =
 job_key(config::AbstractString, package::AbstractString) = string(config, "#", package)
 split_job_key(key::AbstractString) = Tuple(split(key, "#"; limit=2))
 
-log_key(run_id, config, package) = "runs/$run_id/logs/$config/$package.log"
+log_key(run_id, config, package, attempt::Integer=1) =
+    "runs/$run_id/logs/$config/$package" * (attempt == 1 ? "" : ".$attempt") * ".log"
 report_key(run_id, name) = "runs/$run_id/report/$name"
 
 """
